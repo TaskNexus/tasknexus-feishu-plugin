@@ -16,7 +16,7 @@ dependencies = [
 Homepage = "https://github.com/TaskNexus/tasknexus-feishu-plugin.git"
 
 [project.entry-points."tasknexus.plugins"]
-feishu = "tasknexus_feishu:register"
+feishu = "tasknexus_feishu"
 
 [build-system]
 requires = ["hatchling"]
