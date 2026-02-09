@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger('tasknexus.plugins.feishu')
@@ -38,6 +39,8 @@ class FeishuChannel:
         # Message deduplication: track recently processed message IDs
         self._processed_messages: set = set()
         self._message_cache_lock = threading.Lock()
+        # Connection timestamp (milliseconds) to filter out old messages on reconnect
+        self._connection_time_ms: int = 0
     
     @property
     def id(self) -> str:
@@ -81,6 +84,10 @@ class FeishuChannel:
             from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
             
             try:
+                # Record connection time (milliseconds) to filter old messages on reconnect
+                self._connection_time_ms = int(time.time() * 1000)
+                logger.info(f"Connection time set to: {self._connection_time_ms}")
+                
                 # Build Lark client in this thread
                 self.client = lark.Client.builder() \
                     .app_id(app_id) \
@@ -96,6 +103,13 @@ class FeishuChannel:
                         message = event.message
                         sender = event.sender
                         message_id = message.message_id
+                        
+                        # Filter out old messages that were created before this connection
+                        # This prevents historical message replay on reconnection
+                        create_time_ms = int(message.create_time) if message.create_time else 0
+                        if create_time_ms > 0 and create_time_ms < self._connection_time_ms:
+                            logger.info(f"Skipping old message (created {create_time_ms} before connection {self._connection_time_ms}): {message_id}")
+                            return
                         
                         # Deduplicate: check if we've already processed this message
                         with self._message_cache_lock:
@@ -200,7 +214,10 @@ class FeishuChannel:
         Send a message to Feishu.
         
         Args:
-            payload: MessagePayload with chat_id and content
+            payload: MessagePayload with chat_id, content, and msg_type
+                - msg_type='text': Plain text message
+                - msg_type='interactive': Card message (content should be card JSON string)
+                - msg_type='card': Auto-formatted card with Markdown support
             
         Returns:
             True if sent successfully
@@ -215,14 +232,35 @@ class FeishuChannel:
                 CreateMessageRequestBody,
             )
             
-            content = json.dumps({"text": payload.content})
+            msg_type = getattr(payload, 'msg_type', 'text')
+            
+            if msg_type == 'interactive':
+                # Already formatted card JSON - use as-is
+                content = payload.content if isinstance(payload.content, str) else json.dumps(payload.content)
+                feishu_msg_type = "interactive"
+            else:
+                # Default: auto-format as a card with Markdown support
+                # This provides better formatting for all messages in Feishu
+                card = {
+                    "config": {
+                        "wide_screen_mode": True
+                    },
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": payload.content
+                        }
+                    ]
+                }
+                content = json.dumps(card)
+                feishu_msg_type = "interactive"
             
             request = CreateMessageRequest.builder() \
                 .receive_id_type("chat_id") \
                 .request_body(
                     CreateMessageRequestBody.builder()
                         .receive_id(payload.chat_id)
-                        .msg_type("text")
+                        .msg_type(feishu_msg_type)
                         .content(content)
                         .build()
                 ) \
@@ -234,7 +272,7 @@ class FeishuChannel:
                 logger.error(f"Failed to send Feishu message: {response.msg}")
                 return False
             
-            logger.info(f"Sent Feishu message to {payload.chat_id}")
+            logger.info(f"Sent Feishu {feishu_msg_type} message to {payload.chat_id}")
             return True
             
         except Exception as e:
