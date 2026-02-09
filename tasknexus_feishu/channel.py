@@ -8,6 +8,7 @@ Uses lark-oapi SDK with WebSocket long connection for event subscription.
 import asyncio
 import json
 import logging
+import threading
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger('tasknexus.plugins.feishu')
@@ -22,12 +23,21 @@ class FeishuChannel:
         label: Human-readable name ('飞书')
     """
     
+    # Maximum number of message IDs to track for deduplication
+    MESSAGE_CACHE_SIZE = 1000
+    
     def __init__(self):
         self.client = None
         self.ws_client = None
         self._message_callback: Optional[Callable] = None
         self._running = False
         self._config: Dict[str, Any] = {}
+        self._ws_thread: Optional[threading.Thread] = None
+        self._thread_error: Optional[Exception] = None
+        self._thread_started = threading.Event()
+        # Message deduplication: track recently processed message IDs
+        self._processed_messages: set = set()
+        self._message_cache_lock = threading.Lock()
     
     @property
     def id(self) -> str:
@@ -46,9 +56,6 @@ class FeishuChannel:
                 - app_id: Feishu App ID
                 - app_secret: Feishu App Secret
         """
-        import lark_oapi as lark
-        from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
-        
         app_id = config.get('app_id')
         app_secret = config.get('app_secret')
         
@@ -56,72 +63,128 @@ class FeishuChannel:
             raise ValueError("Feishu app_id and app_secret are required")
         
         self._config = config
+        self._running = True
+        self._thread_error = None
         
-        # Build Lark client
-        self.client = lark.Client.builder() \
-            .app_id(app_id) \
-            .app_secret(app_secret) \
-            .log_level(lark.LogLevel.INFO) \
-            .build()
+        logger.info("Starting Feishu WebSocket connection...")
         
-        # Create event handler
-        def handle_message_receive(data: P2ImMessageReceiveV1) -> None:
-            """Handle incoming message event"""
+        # Store message callback reference for use in thread
+        message_callback = self._message_callback
+        channel_id = self.id
+        
+        # Run everything related to lark-oapi in a separate thread with its own event loop
+        # This is because lark-oapi internally uses asyncio.get_event_loop() which
+        # conflicts with the Django management command's event loop
+        def run_ws_client():
+            # Import lark-oapi only in this thread to avoid any module-level event loop capture
+            import lark_oapi as lark
+            from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+            
             try:
-                event = data.event
-                message = event.message
-                sender = event.sender
+                # Build Lark client in this thread
+                self.client = lark.Client.builder() \
+                    .app_id(app_id) \
+                    .app_secret(app_secret) \
+                    .log_level(lark.LogLevel.INFO) \
+                    .build()
                 
-                # Parse message content
-                content = ""
-                if message.message_type == "text":
-                    content_json = json.loads(message.content)
-                    content = content_json.get("text", "")
+                # Create event handler
+                def handle_message_receive(data: P2ImMessageReceiveV1) -> None:
+                    """Handle incoming message event"""
+                    try:
+                        event = data.event
+                        message = event.message
+                        sender = event.sender
+                        message_id = message.message_id
+                        
+                        # Deduplicate: check if we've already processed this message
+                        with self._message_cache_lock:
+                            if message_id in self._processed_messages:
+                                logger.debug(f"Skipping duplicate message: {message_id}")
+                                return
+                            
+                            # Add to processed set
+                            self._processed_messages.add(message_id)
+                            
+                            # Limit cache size to prevent memory growth
+                            if len(self._processed_messages) > self.MESSAGE_CACHE_SIZE:
+                                # Remove oldest entries (convert to list, remove first half)
+                                to_remove = list(self._processed_messages)[:self.MESSAGE_CACHE_SIZE // 2]
+                                for msg_id in to_remove:
+                                    self._processed_messages.discard(msg_id)
+                        
+                        # Parse message content
+                        content = ""
+                        if message.message_type == "text":
+                            content_json = json.loads(message.content)
+                            content = content_json.get("text", "")
+                        
+                        # Import here to avoid circular dependency
+                        from plugins.channel import ChannelMessage
+                        
+                        channel_message = ChannelMessage(
+                            channel_id=channel_id,
+                            chat_id=message.chat_id,
+                            sender_id=sender.sender_id.open_id,
+                            sender_name=sender.sender_id.open_id,  # Could fetch user info
+                            content=content,
+                            raw={
+                                "message_id": message_id,
+                                "message_type": message.message_type,
+                                "create_time": message.create_time,
+                            }
+                        )
+                        
+                        # Call registered callback
+                        if message_callback:
+                            message_callback(channel_message)
+                            
+                    except Exception as e:
+                        logger.exception(f"Error handling Feishu message: {e}")
                 
-                # Import here to avoid circular dependency
-                from plugins.channel import ChannelMessage
+                # Build event dispatcher
+                event_handler = lark.EventDispatcherHandler.builder("", "") \
+                    .register_p2_im_message_receive_v1(handle_message_receive) \
+                    .build()
                 
-                channel_message = ChannelMessage(
-                    channel_id=self.id,
-                    chat_id=message.chat_id,
-                    sender_id=sender.sender_id.open_id,
-                    sender_name=sender.sender_id.open_id,  # Could fetch user info
-                    content=content,
-                    raw={
-                        "message_id": message.message_id,
-                        "message_type": message.message_type,
-                        "create_time": message.create_time,
-                    }
+                # Create WebSocket client
+                # Note: lark.ws.Client takes app_id, app_secret directly, not a lark.Client object
+                self.ws_client = lark.ws.Client(
+                    app_id=app_id,
+                    app_secret=app_secret,
+                    event_handler=event_handler,
+                    log_level=lark.LogLevel.INFO
                 )
                 
-                # Call registered callback
-                if self._message_callback:
-                    self._message_callback(channel_message)
-                    
+                # Signal that thread has started successfully
+                self._thread_started.set()
+                
+                # This blocks until the connection ends
+                self.ws_client.start()
+                
             except Exception as e:
-                logger.exception(f"Error handling Feishu message: {e}")
+                logger.exception(f"WebSocket client error: {e}")
+                self._thread_error = e
+                self._thread_started.set()  # Signal even on error
         
-        # Build event dispatcher
-        event_handler = lark.EventDispatcherHandler.builder("", "") \
-            .register_p2_im_message_receive_v1(handle_message_receive) \
-            .build()
+        self._ws_thread = threading.Thread(target=run_ws_client, daemon=True)
+        self._ws_thread.start()
         
-        # Start WebSocket client
-        self._running = True
-        self.ws_client = lark.ws.Client(
-            self.client,
-            event_handler,
-            log_level=lark.LogLevel.INFO
-        )
+        # Wait for thread to start or fail
+        self._thread_started.wait(timeout=10)
         
-        logger.info(f"Starting Feishu WebSocket connection...")
+        if self._thread_error:
+            raise self._thread_error
         
-        # Run in background
-        self.ws_client.start()
+        logger.info("Feishu WebSocket client started successfully")
         
         # Keep running
         while self._running:
             await asyncio.sleep(1)
+            # Check if thread is still alive
+            if not self._ws_thread.is_alive():
+                logger.warning("WebSocket thread died unexpectedly")
+                break
     
     async def stop(self) -> None:
         """Stop the Feishu WebSocket connection."""
